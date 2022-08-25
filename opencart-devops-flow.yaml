@@ -1,0 +1,282 @@
+---
+project: project
+kind: PIPELINE
+name: opencart-devops-flow
+enabled: true
+description: |-
+  1.代码更新自动编译打包镜像，上传镜像库
+  2.自动交付到K8S容器测试环境，并实现蓝绿发布
+  3.管理员批准后交付到vSphere虚拟机环境
+  4.管理员批准老版本下线
+concurrency: 20
+options: [
+  GIT_TRIGGER]
+input:
+  GIT_BRANCH_NAME: ''
+  GIT_CHANGE_SUBJECT: ''
+  GIT_COMMIT_ID: ''
+  GIT_EVENT_DESCRIPTION: ''
+  GIT_EVENT_OWNER_NAME: ''
+  GIT_EVENT_TIMESTAMP: ''
+  GIT_REPO_NAME: ''
+  GIT_SERVER_URL: ''
+_inputMeta:
+  GIT_SERVER_URL:
+    description: ''
+    mandatory: false
+  GIT_BRANCH_NAME:
+    description: ''
+    mandatory: false
+  GIT_COMMIT_ID:
+    description: ''
+    mandatory: true
+  GIT_EVENT_TIMESTAMP:
+    description: ''
+    mandatory: false
+  GIT_EVENT_DESCRIPTION:
+    description: ''
+    mandatory: false
+  GIT_REPO_NAME:
+    description: ''
+    mandatory: false
+  GIT_EVENT_OWNER_NAME:
+    description: ''
+    mandatory: false
+  GIT_CHANGE_SUBJECT:
+    description: ''
+    mandatory: false
+workspace:
+  endpoint: docker-host
+  image: centos7-http-1:latest
+  registry: harbor
+  path: ''
+  cache:
+  - /root/.m2
+  limits:
+    cpu: 1.0
+    memory: 512
+stageOrder:
+- Build-Image-Publish
+- Dev-integration-test
+- Prod-Deployment
+stages:
+  Prod-Deployment:
+    taskOrder:
+    - newonline-approver
+    - deploy-opencart-vm
+    - offline-approver
+    - pre-opencart-offline
+    tasks:
+      pre-opencart-offline:
+        type: Blueprint
+        ignoreFailure: true
+        input:
+          action: DeleteDeployment
+          deploymentName: opencart-${Build-Image-Publish.Build-Image.output.exports.COMMIT1}
+      offline-approver:
+        type: UserOperation
+        input:
+          approvers:
+          - idmadmin
+          approverGroups: [
+            ]
+          summary: approver
+          description: ''
+          sendemail: false
+          expirationInDays: 3
+          pipelineName: ${name}
+          cancelPreviousPendingUserOp: false
+      deploy-opencart-vm:
+        type: Blueprint
+        input:
+          action: CreateDeployment
+          blueprint: devops-vm
+          deploymentName: opencart-${input.GIT_COMMIT_ID}
+          parameters:
+            flavor: small
+            image: centos7.4
+            commitid: ${input.GIT_COMMIT_ID}
+            env: env:prod
+          version: '1'
+          filepath: ''
+      newonline-approver:
+        type: UserOperation
+        input:
+          approvers:
+          - idmadmin
+          approverGroups: [
+            ]
+          summary: approver
+          description: ''
+          sendemail: false
+          expirationInDays: 3
+          pipelineName: ${name}
+          cancelPreviousPendingUserOp: false
+  Build-Image-Publish:
+    taskOrder:
+    - Clone-SourceRepo
+    - Build-Image,Build-VM-image
+    tasks:
+      Build-Image:
+        type: CI
+        input:
+          steps:
+          - cd opencart
+          - COMMIT=`git rev-parse HEAD`
+          - export IMAGE=192.168.10.137/opencart/test:$COMMIT
+          - export DOCKER_HOST=tcp://192.168.10.135:4343
+          - docker login --username=admin --password=cde3CDE# 192.168.10.137
+          - docker build -t $IMAGE --file ./Dockerfile .
+          - docker push $IMAGE
+          - export COMMIT1=`git log|grep ^comm|head -2|tail -1|awk '{print $2}'`
+          export:
+          - IMAGE
+          - COMMIT1
+          artifacts: [
+            ]
+          process: [
+            ]
+      Clone-SourceRepo:
+        type: CI
+        input:
+          steps:
+          - git clone -b master https://root:cde3CDE#@192.168.10.138/root/opencart.git
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Build-VM-image:
+        type: SSH
+        input:
+          script: |-
+            cd /workdir
+            rm -rf /workdir/opencart
+            git clone -b master https://root:cde3CDE#@192.168.10.138/root/opencart.git
+            cd opencart
+            cp upload/admin/config-dist.php upload/admin/config.php
+            cp upload/admin/config-dist.php upload/config.php
+            tar cvf ./opencart.tar-${input.GIT_COMMIT_ID} ./upload/*
+            scp opencart.tar* root@192.168.10.240:/var/www/html/image
+          username: root
+          password: cde3CDE#
+          passphrase: ''
+          privatekey: ''
+          host: 192.168.10.135
+          workingDirectory: ''
+          arguments: [
+            ]
+          environmentVariables: {
+            }
+  Dev-integration-test:
+    taskOrder:
+    - Deploy-k8s
+    - application-if-exits
+    - expose-service,delete-old-deployment
+    - get-opencart-svc
+    tasks:
+      get-opencart-svc:
+        type: SSH
+        input:
+          script: |-
+            kubectl get svc --all-namespaces
+            kubectl get pod --all-namespaces
+          username: root
+          password: cde3CDE#
+          passphrase: ''
+          privatekey: ''
+          host: 192.168.10.139
+          workingDirectory: ''
+          arguments: [
+            ]
+          environmentVariables: {
+            }
+      application-if-exits:
+        type: SSH
+        ignoreFailure: true
+        input:
+          script: |-
+            app=`kubectl get deployment|grep -v 'NAME'|grep -v opencart-deployment-${input.GIT_COMMIT_ID}|awk '{print $1}'`
+            if [ "$app" == '' ]
+              then
+                 exit 0
+              else
+                 exit 200
+            fi
+            echo $app
+          username: root
+          password: cde3CDE#
+          passphrase: ''
+          privatekey: ''
+          host: 192.168.10.139
+          workingDirectory: ''
+          arguments: [
+            ]
+          environmentVariables: {
+            }
+      delete-old-deployment:
+        type: SSH
+        preCondition: ${Dev-integration-test.application-if-exits.output.exitCode}==200
+        input:
+          script: |-
+            app=`kubectl get deployment|grep -v 'NAME'|grep -v opencart-deployment-${input.GIT_COMMIT_ID}|awk '{print $1}'`
+            kubectl delete deployment $app
+          username: root
+          password: cde3CDE#
+          passphrase: ''
+          privatekey: ''
+          host: 192.168.10.139
+          workingDirectory: ''
+          arguments: [
+            ]
+          environmentVariables: {
+            }
+      Deploy-k8s:
+        type: K8S
+        endpoints:
+          kubernetesServer: k8s-1-14-3
+        input:
+          action: CREATE
+          timeout: 5
+          continueOnConflict: false
+          filePath: ''
+          scmConstants: {
+            }
+          yaml: |-
+            apiVersion: apps/v1beta2
+            kind: Deployment
+            metadata:
+              name: opencart-deployment-${input.GIT_COMMIT_ID}
+            spec:
+              replicas: 1
+              selector:
+                matchLabels:
+                  app: opencart
+              template:
+                metadata:
+                  labels:
+                    app: opencart
+                spec:
+                  containers:
+                  - name: opencart
+                    image: 192.168.10.137/opencart/test:${input.GIT_COMMIT_ID}
+                    ports:
+                    - containerPort: 80
+                  imagePullSecrets:
+                  - name: docker-harbor
+      expose-service:
+        type: K8S
+        preCondition: ${Dev-integration-test.application-if-exits.output.exitCode}==0
+        endpoints:
+          kubernetesServer: k8s-1-14-3
+        input:
+          action: CREATE
+          timeout: 5
+          continueOnConflict: false
+          filePath: ''
+          scmConstants: {
+            }
+          yaml: "apiVersion: v1\nkind: Service\nmetadata:\n  name: opencart-service\n  labels:\n    name:\
+            \ opencart-service\nspec:\n  type: NodePort\n  ports:\n  - port: 80\n    targetPort: 80\n\
+            \    protocol: TCP\n    nodePort: 30001\n  selector:\n    app: opencart "
